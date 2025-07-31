@@ -37,6 +37,889 @@ die() {
     printf "\33[2K\r\033[1;31m%s\033[0m\n" "$*" >&2
     exit 1
 }
+# --- AniList Integration ---
+
+# AniList Configuration
+ANILIST_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli"
+ANILIST_CONFIG_FILE="$ANILIST_CONFIG_DIR/anilist.conf"
+ANILIST_TOKEN_FILE="$ANILIST_CONFIG_DIR/token"
+# AniList Title Mapping for Auto-Tracking
+ANILIST_MAPPINGS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli"
+ANILIST_MAPPINGS_FILE="$ANILIST_MAPPINGS_DIR/mappings.conf"
+# Ensure the mappings directory exists
+mkdir -p "$ANILIST_MAPPINGS_DIR" 2>/dev/null || true # Ignore errors, path might exist or be unwritable
+
+# Ensure config directory exists
+mkdir -p "$ANILIST_CONFIG_DIR" 2>/dev/null || die "Failed to create AniList config directory: $ANILIST_CONFIG_DIR"
+
+# Function to get config value
+anilist_get_config() {
+    local key="$1"
+    if [ -f "$ANILIST_CONFIG_FILE" ]; then
+        grep "^${key}=" "$ANILIST_CONFIG_FILE" | cut -d'=' -f2
+    fi
+}
+
+# Function to set config value
+anilist_set_config() {
+    local key="$1"
+    local value="$2"
+
+    # Create file if it doesn't exist
+    touch "$ANILIST_CONFIG_FILE" || die "Cannot create AniList config file"
+
+    # Remove existing key if it exists
+    if grep -q "^${key}=" "$ANILIST_CONFIG_FILE" 2>/dev/null; then
+        grep -v "^${key}=" "$ANILIST_CONFIG_FILE" > "${ANILIST_CONFIG_FILE}.tmp" && mv "${ANILIST_CONFIG_FILE}.tmp" "$ANILIST_CONFIG_FILE"
+    fi
+
+    echo "${key}=${value}" >> "$ANILIST_CONFIG_FILE"
+}
+
+# Function to get access token
+anilist_get_token() {
+    if [ -f "$ANILIST_TOKEN_FILE" ]; then
+        cat "$ANILIST_TOKEN_FILE"
+    fi
+}
+
+# Function to save access token
+anilist_save_token() {
+    local token="$1"
+    echo "$token" > "$ANILIST_TOKEN_FILE"
+}
+
+# Function to check if jq is available
+anilist_check_jq() {
+    if ! command -v jq >/dev/null 2>&1; then
+        die "jq is required for AniList features. Please install jq."
+    fi
+}
+
+# Function to make a GraphQL request to AniList
+# Usage: anilist_graphql_query "$query_string" ["$variables_json_string"]
+# Function to make a GraphQL request to AniList
+# Usage: anilist_graphql_query "$query_string" ["$variables_json_string"]
+# Function to make a GraphQL request to AniList
+# Usage: anilist_graphql_query "$query_string" ["$variables_json_string"]
+# Function to make a GraphQL request to AniList
+# Usage: anilist_graphql_query "$query_string" ["$variables_json_string"]
+anilist_graphql_query() {
+    local query="$1"
+    local variables="$2" # Optional JSON string for variables (must be a valid JSON object string like '{"status":["CURRENT"]}')
+
+    local token
+    token=$(anilist_get_token)
+
+    # Correctly build headers array
+    local headers_args=()
+    headers_args+=("-H" "Content-Type: application/json")
+    headers_args+=("-H" "Accept: application/json")
+    if [ -n "$token" ]; then
+        headers_args+=("-H" "Authorization: Bearer $token")
+    fi
+
+    # --- REVISED FIX: Use jq to build the JSON payload if available ---
+    local data
+    if command -v jq >/dev/null 2>&1; then
+        # Use jq to build the JSON payload correctly.
+        # If variables is provided and not empty, include it.
+        if [ -n "$variables" ]; then
+            # shellcheck disable=SC2016
+            data=$(jq -n --arg query "$query" --argjson variables "$variables" '{query: $query, variables: $variables}')
+        else
+            # shellcheck disable=SC2016
+            data=$(jq -n --arg query "$query" '{query: $query}')
+        fi
+    else
+        # Fallback if jq is not available - simpler escaping
+        # This is less robust but might work for simple queries without special chars
+        local escaped_query
+        # Basic escaping for JSON: escape backslashes and quotes
+        escaped_query=$(printf '%s' "$query" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -n "$variables" ]; then
+            data="{\"query\":\"$escaped_query\",\"variables\":$variables}"
+        else
+            data="{\"query\":\"$escaped_query\"}"
+        fi
+    fi
+
+    # Check if data construction was successful
+    if [ $? -ne 0 ] || [ -z "$data" ]; then
+        die "Failed to construct GraphQL request payload."
+    fi
+
+    # Debug: Uncomment one or both lines below for debugging
+    # echo "DEBUG: Sending GraphQL request DATA: $data" >&2
+    # echo "DEBUG: Headers args: ${headers_args[*]}" >&2
+
+    local response
+    # shellcheck disable=SC2155
+    # Use --data-binary to prevent curl from doing any processing on the data
+    response=$(curl -s -X POST \
+        "${headers_args[@]}" \
+        --data-binary "$data" \
+        "https://graphql.anilist.co")
+
+    # Debug: Uncomment to see the raw response
+    # echo "DEBUG: Raw GraphQL response: $response" >&2
+
+    # Check for network errors in curl response itself (exit code)
+    # Note: A 4xx/5xx HTTP status code does *not* make curl exit with non-zero by default
+    if [ $? -ne 0 ]; then
+        die "Network error occurred while contacting AniList API (curl failed)."
+    fi
+
+    # Check for HTTP protocol level errors (e.g., 500, 400) by checking if response is JSON with an 'errors' field
+    # We prioritize checking the content over the HTTP status code for GraphQL APIs
+    if command -v jq >/dev/null 2>&1; then
+        # If jq is available, parse the JSON to check for errors
+        if echo "$response" | jq -e '.errors' >/dev/null 2>&1; then
+            # Try to get a detailed error message from the first error
+            local error_msg
+            # Use // to provide a fallback if .message is null/missing
+            error_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown AniList API error (jq found errors array)"' 2>/dev/null)
+            # Final fallback if jq command itself failed or produced empty output
+            if [ $? -ne 0 ] || [ -z "$error_msg" ] || [ "$error_msg" = "null" ]; then
+                 error_msg="Unknown AniList API error (failed to parse error message with jq)"
+            fi
+            die "AniList API Error: $error_msg"
+        fi
+    else
+        # If jq is not available, do a basic check for the presence of "errors" in the response text
+        # This is less reliable but a reasonable fallback
+        if echo "$response" | grep -q '"errors"'; then
+             die "AniList API returned an error (jq recommended for detailed errors). Response snippet: $(echo "$response" | head -c 200)..."
+        fi
+    fi
+
+    # If we get here, the request was successful (as far as we can tell without jq)
+    echo "$response"
+}
+# Function to setup AniList integration
+anilist_setup() {
+    echo "=== AniList Setup ==="
+    echo "1. Go to https://anilist.co/settings/developer"
+    echo "2. Click 'Create New Client'"
+    echo "3. Fill in:"
+    echo "   - Name: ani-cli-tracker"
+    echo "   - Redirect URL: https://anilist.co/api/v2/oauth/pin"
+    echo ""
+
+    printf "Enter your AniList Client ID: "
+    read -r client_id
+    if [ -z "$client_id" ]; then
+        die "Client ID cannot be empty."
+    fi
+
+    printf "Enter your AniList Client Secret: "
+    read -rs client_secret
+    echo # Newline after hidden input
+    if [ -z "$client_secret" ]; then
+        die "Client Secret cannot be empty."
+    fi
+
+    anilist_set_config "client_id" "$client_id"
+    anilist_set_config "client_secret" "$client_secret"
+
+    echo "Configuration saved successfully to $ANILIST_CONFIG_FILE!"
+    echo "Now run 'ani-cli anilist-auth' to authenticate."
+    exit 0
+}
+
+# Function to authenticate with AniList
+anilist_auth() {
+    anilist_check_jq # Ensure jq is available
+
+    local client_id
+    client_id=$(anilist_get_config "client_id")
+    local client_secret
+    client_secret=$(anilist_get_config "client_secret")
+
+    if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
+        die "AniList Client ID or Secret not configured. Run 'ani-cli anilist-setup' first."
+    fi
+
+    local auth_url="https://anilist.co/api/v2/oauth/authorize?client_id=${client_id}&response_type=code"
+    echo "Please visit this URL to authenticate:"
+    echo "$auth_url"
+    echo ""
+    printf "Press Enter after visiting the URL to continue..."
+    read -r
+
+    printf "Enter the authorization code from the URL: "
+    read -r auth_code
+
+    if [ -z "$auth_code" ]; then
+        die "Authorization code cannot be empty."
+    fi
+
+    # Exchange code for token
+    echo "Exchanging code for access token..."
+    local response
+    response=$(curl -s -X POST \
+        -d "grant_type=authorization_code" \
+        -d "client_id=$client_id" \
+        -d "client_secret=$client_secret" \
+        -d "redirect_uri=https://anilist.co/api/v2/oauth/pin" \
+        -d "code=$auth_code" \
+        "https://anilist.co/api/v2/oauth/token")
+
+    # Debug: Uncomment to see raw auth response
+    # echo "DEBUG: Raw auth response: $response" >&2
+
+    # Check for curl errors
+    if [ $? -ne 0 ]; then
+        die "Network error occurred during authentication"
+    fi
+
+    # Parse response using jq
+    local access_token
+    access_token=$(echo "$response" | jq -r '.access_token' 2>/dev/null)
+
+    if [ "$access_token" = "null" ] || [ -z "$access_token" ] || [ "$access_token" = "" ]; then
+        local error_description
+        error_description=$(echo "$response" | jq -r '.error_description // .error // "Unknown error"' 2>/dev/null)
+        die "Authentication failed: $error_description"
+    fi
+
+    anilist_save_token "$access_token"
+    echo "Authentication successful! Token saved."
+    exit 0
+}
+
+# Function to search anime on AniList
+anilist_search() {
+    anilist_check_jq
+
+    local search_term="$1"
+
+    if [ -z "$search_term" ]; then
+        die "Usage: ani-cli anilist-search <search_term>"
+    fi
+
+    echo "Searching AniList for: $search_term"
+
+    # GraphQL query must be on one line for shell escaping
+    local query="query (\$search: String) { Page { media (search: \$search, type: ANIME) { id title { romaji english } episodes status } } }"
+    local variables="{\"search\":\"${search_term}\"}"
+
+    local response
+    response=$(anilist_graphql_query "$query" "$variables")
+
+    # Check if response is valid JSON and has data
+    if ! echo "$response" | jq -e '.data.Page.media' >/dev/null 2>&1; then
+        echo "No results found or error parsing response."
+        exit 1
+    fi
+
+    # Check if results exist
+    local result_count
+    result_count=$(echo "$response" | jq '.data.Page.media | length')
+
+    if [ "$result_count" -eq 0 ]; then
+        echo "No anime found matching '$search_term'."
+        exit 0
+    fi
+
+    echo "Found $result_count result(s):"
+    echo "$response" | jq -r '.data.Page.media[] | "[\(.id)] \(.title.romaji) (\(.title.english // "N/A")) - Episodes: \(.episodes // "?") Status: \(.status // "Unknown")"'
+    exit 0
+}
+
+# Function to update progress
+anilist_update_progress() {
+    anilist_check_jq
+
+    local media_id="$1"
+    local progress="$2"
+    local status="${3:-CURRENT}" # Default to CURRENT if not provided
+
+    if [ -z "$media_id" ] || [ -z "$progress" ]; then
+        die "Usage: ani-cli anilist-update <media_id> <progress> [status]"
+    fi
+
+    # Validate media_id is a number
+    if ! printf "%d" "$media_id" >/dev/null 2>&1; then
+        die "Media ID must be a number."
+    fi
+
+    # Validate progress is a number
+    if ! printf "%d" "$progress" >/dev/null 2>&1; then
+        die "Progress must be a number."
+    fi
+
+    # Validate status is one of the allowed values (basic check)
+    case "$status" in
+        CURRENT|PLANNING|COMPLETED|DROPPED|PAUSED|REPEATING) ;;
+        *) echo "Warning: '$status' might not be a standard AniList status." ;;
+    esac
+
+    echo "Updating progress for Media ID $media_id to episode $progress (Status: $status)..."
+
+    # GraphQL mutation must be on one line
+    local mutation="mutation (\$mediaId: Int, \$status: MediaListStatus, \$progress: Int) { SaveMediaListEntry (mediaId: \$mediaId, status: \$status, progress: \$progress) { id status progress } }"
+    local variables="{\"mediaId\":$media_id,\"status\":\"$status\",\"progress\":$progress}"
+
+    local response
+    response=$(anilist_graphql_query "$mutation" "$variables")
+
+    # The function anilist_graphql_query already handles errors, so if we get here, it likely succeeded.
+    echo "Progress updated successfully!"
+    exit 0
+}
+
+# Function to get user's anime list
+# Function to get user's anime list
+anilist_get_list() {
+    anilist_check_jq # Ensure jq is available for parsing
+
+    echo "Fetching your AniList anime list..."
+
+    # Check authentication first
+    local token
+    token=$(anilist_get_token)
+    if [ -z "$token" ]; then
+        die "Not authenticated with AniList. Run 'ani-cli anilist-auth' first."
+    fi
+
+    # --- First, get the Viewer's ID ---
+    local viewer_query="query { Viewer { id name } }"
+    local viewer_response
+    viewer_response=$(anilist_graphql_query "$viewer_query")
+
+    # Debug: Uncomment to see viewer response
+    # echo "DEBUG: Viewer response: $viewer_response" >&2
+
+    # Extract user ID and name using jq
+    local user_id
+    user_id=$(echo "$viewer_response" | jq -r '.data.Viewer.id // empty')
+    local username
+    username=$(echo "$viewer_response" | jq -r '.data.Viewer.name // "Unknown User"')
+
+    if [ -z "$user_id" ] || [ "$user_id" = "null" ]; then
+        die "Failed to get AniList user ID. Response: $viewer_response"
+    fi
+
+    echo "User: $username (ID: $user_id)"
+
+    # --- Now, get the MediaListCollection using the user ID ---
+    # Use the query structure from the Go code (internal.go line 478)
+    local list_query="query (\$userId: Int, \$status: [MediaListStatus]) {
+      MediaListCollection(userId: \$userId, type: ANIME, status_in: \$status) {
+        lists {
+          name
+          isCustomList
+          isSplitCompletedList
+          status
+          entries {
+            id
+            progress
+            status
+            score
+            media {
+              id
+              title {
+                romaji
+                english
+              }
+              episodes
+              duration
+            }
+          }
+        }
+      }
+    }"
+
+    # Define the variables for the query (matching Go code line 497-ish)
+    # Using the statuses found in the Go code logic (internal.go line 715+)
+    local list_variables="{\"userId\":$user_id,\"status\":[\"CURRENT\",\"PLANNING\",\"COMPLETED\",\"DROPPED\",\"PAUSED\",\"REPEATING\"]}"
+
+    local list_response
+    list_response=$(anilist_graphql_query "$list_query" "$list_variables")
+
+    # Debug: Uncomment to see list response
+    # echo "DEBUG: List response: $list_response" >&2
+
+    # Check if the response contains the expected data structure
+    if ! echo "$list_response" | jq -e '.data.MediaListCollection' >/dev/null 2>&1; then
+        echo "No anime lists found or error retrieving lists."
+        # Show a snippet of the response for debugging if it looks like an error
+        if echo "$list_response" | grep -q '"errors"'; then
+            echo "Response snippet: $(echo "$list_response" | head -c 300)..."
+        fi
+        exit 1
+    fi
+
+    # Check if any lists were returned
+    local list_count
+    list_count=$(echo "$list_response" | jq '.data.MediaListCollection.lists | length')
+
+    if [ "$list_count" -eq 0 ] || [ "$list_count" = "null" ]; then
+        echo "You have no anime in tracked lists (Current, Planning, Completed, etc.)."
+        exit 0
+    fi
+
+    echo "Found $list_count list(s):"
+
+    # Iterate through the lists returned by the API
+    local i
+    for i in $(seq 0 $((list_count - 1))); do
+        local list_name
+        local list_status
+        local list_entries_json
+
+        list_name=$(echo "$list_response" | jq -r ".data.MediaListCollection.lists[$i].name // empty")
+        list_status=$(echo "$list_response" | jq -r ".data.MediaListCollection.lists[$i].status // empty")
+        # Get the raw JSON array for entries in this list
+        list_entries_json=$(echo "$list_response" | jq ".data.MediaListCollection.lists[$i].entries")
+
+        # Determine the display name for the list
+        local display_name
+        if [ -n "$list_name" ] && [ "$list_name" != "null" ]; then
+            display_name="$list_name"
+        elif [ -n "$list_status" ] && [ "$list_status" != "null" ]; then
+            display_name="$list_status"
+        else
+            display_name="List $((i+1))"
+        fi
+
+        # Count entries in this specific list
+        local entry_count
+        entry_count=$(echo "$list_entries_json" | jq 'length')
+
+        if [ "$entry_count" -gt 0 ]; then
+            echo ""
+            echo "$display_name ($entry_count):"
+            # Iterate through entries and print them
+            echo "$list_entries_json" | jq -r '.[] | "  - \(.media.title.english // .media.title.romaji // "Unknown Title") (EP \(.progress // 0)/\(.media.episodes // "?")) [\(.status // "UNKNOWN")]"'
+        fi
+    done
+
+    exit 0
+}
+
+# Function for automatic tracking after episode play
+# Enhanced version with interactive fallback for ID mapping
+anilist_auto_track() {
+    # Receive title and episode number from play_episode
+    local anime_title="$1"
+    local episode_number="$2"
+
+    # Basic validation
+    if [ -z "$anime_title" ] || [ -z "$episode_number" ]; then
+        return 0 # Silently exit if missing info
+    fi
+
+    # --- Step 1: Try to get the AniList Media ID ---
+
+    # Priority 1: Use the pre-determined AniList Media ID (e.g., from anilist-select)
+    local anime_id="$ANILIST_SELECTED_MEDIA_ID"
+
+    # Priority 2: Check if we have a saved mapping for this scraped title
+    if [ -z "$anime_id" ] || [ "$anime_id" = "null" ]; then
+        anime_id=$(anilist_get_mapped_id "$anime_title")
+        if [ -n "$anime_id" ] && [ "$anime_id" != "null" ]; then
+             echo "Found AniList ID $anime_id for '$anime_title' in mappings." >&2 # Optional debug
+        fi
+    fi
+
+    # --- Step 2: If no ID found, ask the user ---
+    if [ -z "$anime_id" ] || [ "$anime_id" = "null" ]; then
+        echo "AniList tracking: Could not automatically find ID for '$anime_title'."
+        printf "Please enter the correct anime name as it appears on AniList (or press Enter to skip): "
+        local user_provided_name
+        read -r user_provided_name
+
+        if [ -n "$user_provided_name" ]; then
+            # --- Step 3: Search AniList using the user's provided name ---
+            # Check Authentication
+            local token
+            token=$(anilist_get_token)
+            if [ -z "$token" ]; then
+                echo "AniList tracking: Not authenticated. Cannot search for '$user_provided_name'."
+                return 0
+            fi
+
+            # Perform the search
+            local search_query='query ($search: String) {
+                Page(perPage: 5) {
+                    media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+                        id
+                        title { romaji english }
+                    }
+                }
+            }'
+            # Properly escape the search term for JSON
+            local search_variables
+            search_variables=$(printf '{"search":"%s"}' "$user_provided_name")
+
+            local search_response
+            search_response=$(anilist_graphql_query "$search_query" "$search_variables")
+
+            # Extract the ID from the first result (assume user chose correctly)
+            anime_id=$(echo "$search_response" | jq -r '.data.Page.media[0].id // empty' 2>/dev/null)
+
+            if [ -n "$anime_id" ] && [ "$anime_id" != "null" ]; then
+                # --- Step 4: Save the mapping ---
+                anilist_save_mapping "$anime_title" "$anime_id"
+                echo "AniList tracking: Mapped '$anime_title' to '$user_provided_name' (ID: $anime_id). Will auto-track this anime in the future."
+            else
+                echo "AniList tracking: Could not find an anime named '$user_provided_name' on AniList. Skipping tracking for '$anime_title'."
+                return 0
+            fi
+        else
+            # User pressed Enter, skip tracking
+            echo "AniList tracking: Skipped for '$anime_title'."
+            return 0
+        fi
+    fi
+
+    # --- Step 5: Validate Episode Number ---
+    local clean_episode_number
+    clean_episode_number=$(printf "%d" "$episode_number" 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        # Not a valid integer
+        echo "AniList tracking: Episode number '$episode_number' is invalid. Skipping update for '$anime_title'." >&2
+        return 0
+    fi
+
+    # --- Step 6: Validate Authentication (if we got this far without a pre-set ID) ---
+    # If ANILIST_SELECTED_MEDIA_ID was set, token was likely already checked.
+    # But if ID came from mapping or user input, double-check.
+    if [ -z "$ANILIST_SELECTED_MEDIA_ID" ]; then # Only check if ID wasn't from anilist-select
+        local token
+        token=$(anilist_get_token)
+        if [ -z "$token" ]; then
+            echo "AniList tracking: Not authenticated. Cannot update progress for '$anime_title'." >&2
+            return 0
+        fi
+    fi
+
+    # --- Step 7: Update Progress on AniList ---
+    # Prepare the GraphQL mutation
+    local update_mutation='mutation ($mediaId: Int, $progress: Int) {
+        SaveMediaListEntry(mediaId: $mediaId, progress: $progress) {
+            id
+            progress
+        }
+    }'
+    # Properly format the JSON variables
+    local update_variables
+    update_variables=$(printf '{"mediaId":%s,"progress":%s}' "$anime_id" "$clean_episode_number")
+
+    # Make the API call using the existing helper
+    # Run in background to avoid blocking script exit, redirect output
+    anilist_graphql_query "$update_mutation" "$update_variables" >/dev/null 2>&1 &
+
+    # Optional: Print a confirmation message to the terminal
+    echo "AniList progress update requested for '$anime_title' (ID: $anime_id) to episode $clean_episode_number."
+
+    # Note: Because it runs in the background (&), we don't wait for the result here.
+    # The script can exit, and the update should still complete.
+}
+# Function to format AniList data for the selector (fzf/rofi)
+# Similar logic to anilist_get_list but prepares a string for nth instead of printing
+# Function to save a scraped title to AniList ID mapping
+# Usage: anilist_save_mapping "Scraped Anime Title" "12345"
+anilist_save_mapping() {
+    local scraped_title="$1"
+    local anilist_id="$2"
+
+    if [ -z "$scraped_title" ] || [ -z "$anilist_id" ]; then
+        return 1 # Invalid input
+    fi
+
+    # Ensure the mappings file exists
+    touch "$ANILIST_MAPPINGS_FILE" 2>/dev/null || return 1
+
+    # Escape potential special characters in the title for sed
+    # This prevents issues if the title contains '/', '&', or the delimiter '|'
+    local escaped_title
+    escaped_title=$(printf '%s\n' "$scraped_title" | sed 's/[^^]/[&]/g; s/\^/\\^/g')
+
+    # Check if the mapping already exists
+    if grep -q "^${escaped_title}|" "$ANILIST_MAPPINGS_FILE" 2>/dev/null; then
+        # Mapping exists, update the ID
+        # Use a different delimiter (#) for sed to avoid conflicts with '/' in IDs/paths
+        sed -i.bak "s#^${escaped_title}|.*#${scraped_title}|${anilist_id}#" "$ANILIST_MAPPINGS_FILE" 2>/dev/null
+        # Remove the backup file created by sed -i.bak
+        rm -f "${ANILIST_MAPPINGS_FILE}.bak"
+    else
+        # Mapping doesn't exist, append it
+        echo "${scraped_title}|${anilist_id}" >> "$ANILIST_MAPPINGS_FILE"
+    fi
+}
+# Function to get the AniList ID for a scraped title from the mapping file
+# Usage: anilist_get_mapped_id "Scraped Anime Title"
+# Returns the ID via echo, or nothing if not found
+anilist_get_mapped_id() {
+    local scraped_title="$1"
+
+    if [ -z "$scraped_title" ] || [ ! -f "$ANILIST_MAPPINGS_FILE" ]; then
+        return 1 # No title provided or mappings file doesn't exist
+    fi
+
+    # Escape potential special characters in the title for grep
+    local escaped_title
+    escaped_title=$(printf '%s\n' "$scraped_title" | sed 's/[[\.*^$()+?{|]/\\&/g')
+
+    # Search for the line starting with the exact title followed by '|'
+    # Extract the ID part (after the '|')
+    grep "^${escaped_title}|" "$ANILIST_MAPPINGS_FILE" 2>/dev/null | cut -d'|' -f2 | head -n 1
+}
+anilist_format_for_selector() {
+    # This function echoes the formatted string for nth
+    # Check authentication first
+    local token
+    token=$(anilist_get_token)
+    if [ -z "$token" ]; then
+       # Return error code instead of dying, let caller handle it
+       return 1
+    fi
+
+    # --- Get User ID ---
+    local viewer_query="query { Viewer { id name } }"
+    local viewer_response
+    viewer_response=$(anilist_graphql_query "$viewer_query")
+    local user_id
+    user_id=$(echo "$viewer_response" | jq -r '.data.Viewer.id // empty')
+    if [ -z "$user_id" ] || [ "$user_id" = "null" ]; then
+        return 1
+    fi
+
+    # --- Get MediaListCollection in the desired order ---
+    # Fetch lists for CURRENT, REPEATING, PLANNING, COMPLETED, DROPPED, PAUSED
+    # This order determines the display order in the selector
+    local list_query="query (\$userId: Int, \$status: [MediaListStatus]) {
+      MediaListCollection(userId: \$userId, type: ANIME, status_in: \$status) {
+        lists {
+          name
+          status
+          entries {
+            id
+            progress
+            status
+            media {
+              id
+              title {
+                romaji
+                english
+              }
+              episodes
+            }
+          }
+        }
+      }
+    }"
+    # Define the status order for fetching AND displaying
+    # The order in this array determines the order categories appear in the selector
+    local list_variables="{\"userId\":$user_id,\"status\":[\"CURRENT\",\"REPEATING\",\"PLANNING\",\"COMPLETED\",\"DROPPED\",\"PAUSED\"]}"
+
+    local list_response
+    list_response=$(anilist_graphql_query "$list_query" "$list_variables")
+
+    # Check if the response contains the expected data structure
+    if ! echo "$list_response" | jq -e '.data.MediaListCollection' >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # --- Build the string for the selector ---
+    local grouped_entries_str=""
+    # Define the order and display names for statuses
+    # Format: "API_STATUS_KEY:DISPLAY_NAME"
+    local status_display_order=(
+        "CURRENT:Watching"
+        "REPEATING:Rewatching"
+        "PLANNING:Planning"
+        "COMPLETED:Completed"
+        "DROPPED:Dropped"
+        "PAUSED:Paused"
+    )
+
+    # Iterate through the defined display order
+    local status_entry
+    local status_key
+    local display_name
+    local list_json
+    local entry_count
+    local formatted_entries
+    for status_entry in "${status_display_order[@]}"; do
+        # Split the status_entry into status_key and display_name
+        IFS=':' read -r status_key display_name <<< "$status_entry"
+
+        # Use jq to extract the list data for this specific status
+        list_json=$(echo "$list_response" | jq -e --arg status_key "$status_key" '.data.MediaListCollection.lists[] | select(.status == $status_key)' 2>/dev/null)
+
+        # Check if jq found a list for this status
+        if [ $? -eq 0 ] && [ -n "$list_json" ]; then
+            # Get the number of entries in this list
+            entry_count=$(echo "$list_json" | jq -r '.entries | length')
+
+            # Only add the category if it has entries
+            if [ "$entry_count" -gt 0 ]; then
+                # Add the category header (no tab, not selectable by nth)
+                grouped_entries_str="${grouped_entries_str}${display_name} (${entry_count})"$'\n'
+
+                # Use jq to format the entries for this list
+                # Format for nth: "  MediaID\tTitle (Episodes) - Progress: X/Y"
+                # The leading '  ' (two spaces) is crucial for visual distinction in fzf/rofi
+                # and to help distinguish from headers (though nth itself doesn't care about this)
+                formatted_entries=$(echo "$list_json" | jq -r '.entries[] |
+                    .media.id as $id |
+                    (.media.title.english // .media.title.romaji // "Unknown Title") as $title |
+                    (.media.episodes // "?") as $episodes |
+                    "  \($id)\t\($title) (\($episodes) episodes) - Progress: \(.progress)/\($episodes)"
+                ' 2>/dev/null)
+
+                # Check if jq formatting was successful
+                if [ $? -eq 0 ]; then
+                    # Append the formatted entries to the main string
+                    grouped_entries_str="${grouped_entries_str}${formatted_entries}"$'\n'
+                     # Add a blank line for visual separation between categories in fzf/rofi
+                     grouped_entries_str="${grouped_entries_str}"$'\n'
+                else
+                    # If jq failed on this list's entries, add a placeholder
+                    grouped_entries_str="${grouped_entries_str}  (Error formatting entries for this list)"$'\n'
+                fi
+            fi
+        fi
+        # If jq didn't find the status, the user has no entries in that list.
+        # We simply don't add a header for it.
+    done
+
+    # Echo the final formatted string so the caller can capture it
+    printf "%s" "$grouped_entries_str"
+    return 0
+}
+# Function to handle the anilist-select command logic
+# Fetches 'Watching' list, determines next episode,
+# and executes a new 'ani-cli -e <ep> <title>' command.
+select_from_anilist() {
+    # --- AniList Selection Mode ---
+    anilist_check_jq
+
+    token=$(anilist_get_token)
+    if [ -z "$token" ]; then
+        die "Not authenticated with AniList. Run 'ani-cli anilist-auth' first."
+    fi
+
+    echo "Fetching your 'Watching' list from AniList..."
+
+    # --- Get User ID ---
+    viewer_query="query { Viewer { id name } }"
+    viewer_response=$(anilist_graphql_query "$viewer_query")
+    user_id=$(echo "$viewer_response" | jq -r '.data.Viewer.id // empty')
+    username=$(echo "$viewer_response" | jq -r '.data.Viewer.name // "Unknown User"')
+    if [ -z "$user_id" ] || [ "$user_id" = "null" ]; then
+        die "Failed to get AniList user ID."
+    fi
+    echo "User: $username"
+
+    # --- Get ONLY the CURRENT (Watching) list ---
+    list_query="query (\$userId: Int) {
+      MediaListCollection(userId: \$userId, type: ANIME, status: CURRENT) {
+        lists {
+          entries {
+            id
+            progress
+            media {
+              id
+              title {
+                romaji
+                english
+              }
+              episodes
+            }
+          }
+        }
+      }
+    }"
+    list_variables="{\"userId\":$user_id}"
+
+    list_response=$(anilist_graphql_query "$list_query" "$list_variables")
+
+    # Check if the response contains the expected data structure and has a list
+    if ! echo "$list_response" | jq -e '.data.MediaListCollection.lists[0]' >/dev/null 2>&1; then
+        die "No 'Watching' list found or error retrieving it from AniList."
+    fi
+
+    # --- Extract and Format Entries for nth (DisplayTitle\tID) ---
+    # Format for nth: "Title (EP Progress/Total)\tMediaID"
+    formatted_entries=$(echo "$list_response" | jq -r '
+        .data.MediaListCollection.lists[0].entries[] |
+        .media.id as $media_id |
+        (.media.title.english // .media.title.romaji // "Unknown Title") as $title |
+        (.media.episodes // "?") as $total_episodes |
+        .progress as $progress |
+        "\($title) (EP \($progress)/\($total_episodes))\t\($media_id)"
+    ' 2>/dev/null)
+
+    # Check if any entries were found
+    if [ $? -ne 0 ] || [ -z "$formatted_entries" ]; then
+         die "Failed to process your 'Watching' list data or it is empty."
+    fi
+
+    # --- Let User Select an Anime ---
+    echo "Select an anime from your 'Watching' list:"
+    result=""
+    result=$(printf "%s" "$formatted_entries" | nth "Select anime: ")
+
+    # Check if a selection was made
+    if [ -z "$result" ]; then
+        echo "No anime selected. Exiting."
+        exit 1
+    fi
+    # At this point, `result` holds the full selected line: "Title (EP Progress/Total)\tActualMediaID"
+
+    # --- Extract Data from Selection ---
+    # Extract the display part (FIRST field before tab) - This is what the user saw/selected
+    display_part=$(printf "%s" "$result" | cut -f1)
+    # Extract the Actual AniList Media ID (second field after tab) - For potential future use/tracking
+    # anilist_media_id=$(printf "%s" "$result" | cut -f2) # Not used in this approach
+
+    # --- Extract Clean Title for the New Command ---
+    # Get "Title" from "Title (EP Progress/TotalEpisodes)"
+    title_for_command=$(printf "%s" "$display_part" | awk -F' \\(EP' '{print $1}')
+    if [ -z "$title_for_command" ]; then
+        title_for_command=$(printf "%s" "$display_part" | sed 's/ (.*)$//')
+    fi
+    if [ -z "$title_for_command" ]; then
+        title_for_command="$display_part"
+    fi
+
+    # --- Determine Episode Number to Play ---
+    # Extract progress from the display_part "Title (EP Progress/Total)"
+    current_progress=""
+    current_progress=$(printf "%s" "$display_part" | sed -n 's/.*(EP \([0-9]*\)\/.*/\1/p')
+
+    ep_no="" # Initialize the episode number variable
+    if [ -n "$current_progress" ] && [ "$current_progress" -ge 0 ] 2>/dev/null; then
+        # Calculate the next episode number to play
+        ep_no=$((current_progress + 1))
+        echo "Determined next episode based on AniList progress ($current_progress): $ep_no"
+    else
+        # If progress couldn't be determined, we cannot proceed automatically.
+        echo "Could not determine progress from AniList entry '$display_part'. Cannot continue automatically."
+        exit 1
+    fi
+
+    # --- Construct and Execute the New ani-cli Command ---
+    # Use the script's own name ($0) to ensure we call the correct instance
+    # Quote the title to handle spaces and special characters
+    new_command="$0 -e $ep_no \"$title_for_command\""
+
+    echo "Executing: $new_command"
+    # Execute the new command. Using 'exec' replaces the current process.
+    # If you want the original ani-cli to continue running after (e.g., for tracking),
+    # remove 'exec' and just run the command.
+    exec $new_command
+
+    # Note: If exec is used, the lines below will not be reached.
+    # If you remove exec, you might want logic here to handle post-playback
+    # actions like AniList tracking if desired, although the new instance
+    # of ani-cli should handle its own tracking if auto-tracking is enabled.
+}
 
 help_info() {
     printf "
@@ -84,6 +967,13 @@ help_info() {
         Display a countdown to the next episode
       -U, --update
         Update the script
+    AniList Commands:
+        anilist-setup           Setup AniList integration (first time only)
+        anilist-auth            Authenticate with AniList
+        anilist-search <term>   Search for anime on AniList
+        anilist-update <id> <ep> Update episode progress
+        anilist-list            Show your anime list
+        anilist-select          Select anime from anilist to watch
     Some example usages:
       %s -q 720p banana fish
       %s --skip --skip-title \"one piece\" -S 2 one piece
@@ -301,47 +1191,136 @@ download() {
     esac
 }
 
+# Function to play a single episode
+# This function handles the actual playback of an episode using the specified player.
+# It is called by the main `play` function.
 play_episode() {
-    [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t ani-cli "${allanime_title}${ep_no}"
-    [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -q "$mal_id" -e "$ep_no")"
+    # --- Setup for Episode Playback ---
+    # Store the current cursor position so we can return to it after printing
+    [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && tput sc
+
+    # --- Get the Episode Link ---
+    # Ensure the episode link is fetched or available
     [ -z "$episode" ] && get_episode_url
+
+    # --- Prepare Player Arguments ---
+    # Handle subtitle and refresh flags based on player
+    [ -n "$subs_flag" ] && [ "$player_function" != *mpv* ] && subs_flag="--sub-file=$subtitle"
+    [ -n "$refr_flag" ] && [ "$player_function" != *mpv* ] && refr_flag="--framedrop=${refr_flag#--}"
+
+    # --- Logging ---
+    # Log the episode being played if enabled and not in debug/download mode
+    [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t ani-cli "${allanime_title}${ep_no}"
+
+    # --- Skip Intro (if enabled) ---
+    # Get skip intro timecodes if the feature is enabled
+    [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -q "$mal_id" -e "$ep_no")"
+
+    # --- Debug Mode ---
+    # If in debug mode, just print the links and exit
+    [ "$player_function" = "debug" ] && {
+        printf "All links:%sSelected link:" "$links"
+        printf "%s" "$episode"
+        return
+    }
+
+    # --- Player Execution ---
+    # Use case statement to handle different player configurations
     # shellcheck disable=SC2086
     case "$player_function" in
-        debug)
-            printf "All links:\n%s\nSelected link:\n" "$links"
-            printf "%s\n" "$episode"
-            ;;
-        mpv*)
+        *mpv*)
+            # --- mpv Player ---
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function $skip_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag >/dev/null 2>&1 &
+                # Detached mode (runs in background)
+                if [ "$use_external_menu" = 1 ]; then
+                    # External menu is used, run mpv in background
+                    nohup $player_function "$episode" --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $skip_flag >/dev/null 2>&1 &
+                else
+                    # Standard detached mode
+                    $player_function "$episode" --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $skip_flag >/dev/null 2>&1 &
+                fi
+                # Wait for mpv process to start and get its PID
+                PID=$!
+                # Give mpv a moment to start
+                sleep 1
+                # Check if mpv process is still running
+                if ps -p $PID >/dev/null 2>&1; then
+                    # If running, wait for it to finish
+                    wait $PID
+                    mpv_exitcode=$?
+                else
+                    # If not running, get the exit code immediately
+                    mpv_exitcode=$?
+                fi
             else
-                $player_function $skip_flag $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
+                # Non-detached mode (runs in foreground)
+                $player_function "$episode" --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $skip_flag
                 mpv_exitcode=$?
-                [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
             ;;
-        android_mpv) nohup am start --user 0 -a android.intent.action.VIEW -d "$episode" -n is.xyz.mpv/.MPVActivity >/dev/null 2>&1 & ;;
-        android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$episode" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${allanime_title}Episode ${ep_no}" >/dev/null 2>&1 & ;;
-        *iina*)
-            [ -n "$subs_flag" ] && subs_flag="--mpv-${subs_flag#--}"
-            [ -n "$refr_flag" ] && refr_flag="--mpv-${refr_flag#--}"
-            nohup $player_function --no-stdin --keep-running --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag "$episode" >/dev/null 2>&1 &
+        *vlc*)
+            # --- VLC Player ---
+            if [ "$no_detach" = 0 ]; then
+                # Detached mode (background)
+                if [ "$use_external_menu" = 1 ]; then
+                    # External menu used, run VLC in background
+                    nohup $player_function "$episode" --input-title-format="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag >/dev/null 2>&1 &
+                else
+                    # Standard detached mode
+                    $player_function "$episode" --input-title-format="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag >/dev/null 2>&1 &
+                fi
+                # Wait for VLC to finish
+                wait
+            else
+                # Non-detached mode (foreground)
+                $player_function "$episode" --input-title-format="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag
+            fi
             ;;
-        flatpak_mpv) flatpak run io.mpv.Mpv --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag >/dev/null 2>&1 & ;;
-        vlc*) nohup $player_function --http-referrer="${allanime_refr}" --play-and-exit --meta-title="${allanime_title}Episode ${ep_no}" "$episode" >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function "$episode" -- --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag >/dev/null 2>&1 & ;;
-        download) "$player_function" "$episode" "${allanime_title}Episode ${ep_no}" "$subtitle" ;;
-        catt) nohup catt cast "$episode" -s "$subtitle" >/dev/null 2>&1 & ;;
+        syncplay*)
+            # --- Syncplay ---
+            # Run syncplay in background
+            nohup $player_function "$episode" -- --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag >/dev/null 2>&1 &
+            ;;
+        download)
+            # --- Download Mode ---
+            # Call the player function to download the episode
+            "$player_function" "$episode" "${allanime_title}Episode ${ep_no}" "$subtitle"
+            ;;
+        catt)
+            # --- Cast to Device (catt) ---
+            # Run catt in background
+            nohup catt cast "$episode" -s "$subtitle" >/dev/null 2>&1 &
+            ;;
         iSH)
-            printf "\e]8;;vlc://%s\a~~~~~~~~~~~~~~~~~~~~\n~ Tap to open VLC ~\n~~~~~~~~~~~~~~~~~~~~\e]8;;\a\n" "$episode"
+            # --- iSH (iOS Shell) ---
+            # Print a clickable link for VLC on iOS
+            printf "\e]8;;vlc://%s\a~~~~~~~~~~~~~~~~~~~~~ Tap to open VLC ~~~~~~~~~~~~~~~~~~~~~\e]8;;\a" "$episode"
             sleep 5
             ;;
-        *) nohup $player_function "$episode" >/dev/null 2>&1 & ;;
+        *)
+            # --- Default Player ---
+            # Run the player in background
+            nohup $player_function "$episode" >/dev/null 2>&1 &
+            ;;
     esac
+
+    # --- Store Replay Link ---
+    # Save the episode link in case it's needed for replay
     replay="$episode"
+    # Unset the episode variable
     unset episode
+
+    # --- Post-Playback Actions ---
+    # Update the local history file after playback finishes.
     update_history
+
+    anilist_auto_track "$allanime_title" "$ep_no"
+
+    # Wait for any background jobs to finish if external menu is used
     [ "$use_external_menu" = "1" ] && wait
+
+    # If the script is set to exit after playing and it wasn't a range, exit with mpv's exit code
+    [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
 }
 
 play() {
@@ -468,6 +1447,47 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -N | --nextep-countdown) search=nextep ;;
+        # --- AniList Commands ---
+        anilist-setup)
+            anilist_setup
+            ;;
+        anilist-auth)
+            anilist_auth
+            ;;
+        anilist-search)
+            shift
+            if [ $# -lt 1 ]; then
+                die "Usage: ani-cli anilist-search <search_term>"
+            fi
+            # Join remaining arguments for multi-word searches
+            local search_query=""
+            while [ $# -gt 0 ]; do
+                if [ -z "$search_query" ]; then
+                    search_query="$1"
+                else
+                    search_query="$search_query $1"
+                fi
+                shift
+            done
+            anilist_search "$search_query"
+            ;;
+        --A)
+            search=anilist
+            ;;
+        anilist-update)
+            shift
+            if [ $# -lt 2 ]; then
+                die "Usage: ani-cli anilist-update <media_id> <progress> [status]"
+            fi
+            local aid="$1"
+            local prog="$2"
+            local stat="$3" # Optional
+            anilist_update_progress "$aid" "$prog" "$stat"
+            ;;
+        anilist-list)
+            anilist_get_list
+            ;;
+        # --- End AniList Commands ---
         -U | --update) update_script ;;
         *) query="$(printf "%s" "$query $1" | sed "s|^ ||;s| |+|g")" ;;
     esac
@@ -503,6 +1523,13 @@ case "$search" in
         ep_no=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed -nE 's/.*- episode (.+)$/\1/p')
         allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
         ;;
+    anilist)
+        # - Anilist Selection Mode -
+        # Call the function to handle the logic
+        select_from_anilist
+        ;;
+
+
     *)
         if [ "$use_external_menu" = "0" ]; then
             while [ -z "$query" ]; do

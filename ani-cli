@@ -370,7 +370,6 @@ anilist_update_progress() {
 }
 
 # Function to get user's anime list
-# Function to get user's anime list
 anilist_get_list() {
     anilist_check_jq # Ensure jq is available for parsing
 
@@ -968,12 +967,12 @@ help_info() {
       -U, --update
         Update the script
     AniList Commands:
-        anilist-setup           Setup AniList integration (first time only)
-        anilist-auth            Authenticate with AniList
-        anilist-search <term>   Search for anime on AniList
-        anilist-update <id> <ep> Update episode progress
-        anilist-list            Show your anime list
-        anilist-select          Select anime from anilist to watch
+      --anilist-setup            Setup AniList integration (first time only)
+      --anilist-auth             Authenticate with AniList
+      --anilist-search <term>    Search for anime on AniList
+      --anilist-update <id> <ep> Update episode progress
+      --anilist-list             Show your anime list
+      --A,                      Select anime from anilist to watch
     Some example usages:
       %s -q 720p banana fish
       %s --skip --skip-title \"one piece\" -S 2 one piece
@@ -1448,13 +1447,13 @@ while [ $# -gt 0 ]; do
             ;;
         -N | --nextep-countdown) search=nextep ;;
         # --- AniList Commands ---
-        anilist-setup)
+        --anilist-setup)
             anilist_setup
             ;;
-        anilist-auth)
+        --anilist-auth)
             anilist_auth
             ;;
-        anilist-search)
+        --anilist-search)
             shift
             if [ $# -lt 1 ]; then
                 die "Usage: ani-cli anilist-search <search_term>"
@@ -1474,14 +1473,14 @@ while [ $# -gt 0 ]; do
         --A)
             search=anilist
             ;;
-        anilist-update)
+        --anilist-update)
             shift
             if [ $# -lt 2 ]; then
                 die "Usage: ani-cli anilist-update <media_id> <progress> [status]"
             fi
-            local aid="$1"
-            local prog="$2"
-            local stat="$3" # Optional
+            aid="$1"          # Removed 'local'
+            prog="$2"         # Removed 'local'
+            stat="$3"         # Removed 'local'
             anilist_update_progress "$aid" "$prog" "$stat"
             ;;
         anilist-list)

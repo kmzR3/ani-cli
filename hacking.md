@@ -1,5 +1,5 @@
 # Hacking ani-cli
-Ani-cli is set up to scrape one platform - currently allanime. Supporting multiple sources at a time would require more changes than we (the maintainers) find worth doing, for this reason any feature request asking for a new site is rejected.
+Ani-cli is set up to scrape one platform - currently hianime. Supporting multiple sources at a time would require more changes than we (the maintainers) find worth doing, for this reason any feature request asking for a new site is rejected.
 
 However ani-cli being open-source and the pirate anime streaming sites being so similar you can hack ani-cli to support any site that follows a few conventions.
 
@@ -103,6 +103,26 @@ Assuming you completed all the necessary modifications, ani-cli should completel
 The UI and the history system works as long as you keep the structure of the original code and the format of the responses.
 
 There might be cases that can't be covered by the current structure of ani-cli, but still it works for most sites as I've observed.
+
+## Extensions
+
+Optional, self-contained modules can be dropped into the `ext.d` directory next
+to the script (override the location with `ANI_CLI_EXT_DIR`). ani-cli sources
+every `ext.d/*.sh` at startup and exposes exactly three no-op hooks that a
+module may override:
+
+- `ext_handle_option` — called with the remaining argument list before
+  unmatched arguments become a search query. To claim arguments, set
+  `ext_consumed` to how many of them (including `$1`) were handled and return
+  `0`; return `1` to leave them alone.
+- `ext_help` — printed at the end of `--help`.
+- `ext_episode_played` — called after an episode starts playing, with the
+  title and episode number.
+
+That is the whole extension API. Nothing else in `ani-cli` knows that
+extensions exist, so deleting `ext.d` (or pointing `ANI_CLI_EXT_DIR` at an
+empty directory) restores stock ani-cli behaviour. `ext.d/anilist.sh` is a
+complete example.
 
 ## UX Spec
 

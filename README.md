@@ -451,10 +451,25 @@ This can be achieved from NixManager as well, my personal recommendation is to u
 
 Install dependencies [(See below)](#dependencies)
 
+The `ani-cli` script must stay next to its `ext.d/` directory (the AniList
+integration), so install both together:
+
 ```sh
-git clone "https://github.com/pystardust/ani-cli.git"
-sudo cp ani-cli/ani-cli /usr/local/bin
+git clone "https://github.com/kmzR3/ani-cli.git"
+sudo install -Dm755 ani-cli/ani-cli /usr/local/bin/ani-cli
+sudo install -Dm644 ani-cli/ext.d/anilist.sh /usr/local/bin/ext.d/anilist.sh
+sudo install -Dm644 ani-cli/ani-cli.1 /usr/local/share/man/man1/ani-cli.1
 rm -rf ani-cli
+```
+
+Alternatively, symlink the script from a clone — the script follows symlinks
+when locating `ext.d`, and `-U` keeps updating the clone:
+
+```sh
+git clone "https://github.com/kmzR3/ani-cli.git" ~/.local/share/ani-cli
+mkdir -p ~/.local/bin
+ln -sf ~/.local/share/ani-cli/ani-cli ~/.local/bin/ani-cli
+# make sure ~/.local/bin is in your PATH
 ```
 
 ## Uninstall

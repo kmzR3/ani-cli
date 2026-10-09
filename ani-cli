@@ -465,7 +465,20 @@ ext_episode_played() {
     :
 }
 
-ext_dir="${ANI_CLI_EXT_DIR:-$(dirname "$0")/ext.d}"
+# follow symlinks so symlinked installs still find the ext.d next to the real
+# script (readlink is not in POSIX but is present wherever -L works in practice)
+_self="$0"
+_links=0
+while [ -L "$_self" ] && [ "$_links" -lt 40 ]; do
+    _link=$(readlink "$_self" 2>/dev/null) || break
+    case "$_link" in
+        /*) _self="$_link" ;;
+        *) _self="$(dirname "$_self")/$_link" ;;
+    esac
+    _links=$((_links + 1))
+done
+
+ext_dir="${ANI_CLI_EXT_DIR:-$(dirname "$_self")/ext.d}"
 if [ -d "$ext_dir" ]; then
     for ext in "$ext_dir"/*.sh; do
         [ -r "$ext" ] || continue
@@ -473,7 +486,7 @@ if [ -d "$ext_dir" ]; then
         . "$ext"
     done
 fi
-unset ext ext_dir
+unset ext ext_dir _self _link _links
 
 # MAIN
 

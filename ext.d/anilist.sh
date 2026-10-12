@@ -17,6 +17,12 @@
 #   token          AniList OAuth access token     (--anilist-auth)
 #   mappings.conf  scraped title -> media id map used for auto-tracking
 #
+# -A and --anilist-list take an optional category word (watching, planning,
+# completed, rewatching, paused, dropped) to pick which AniList list they
+# operate on. Auto-tracking keeps statuses in sync: finishing marks COMPLETED,
+# starting a COMPLETED anime again moves it to REPEATING and bumps the rewatch
+# count, and planning/paused/dropped entries resume as CURRENT.
+#
 # Requires jq. Uses ani-cli's curl executable when it is set.
 
 # shellcheck disable=SC2154 # die/nth/info/dep_ch and runtime state come from ani-cli
@@ -67,6 +73,33 @@ anilist_save_token() {
 
 anilist_check_jq() {
     command -v jq >/dev/null 2>&1 || die "jq is required for AniList features. Please install jq."
+}
+
+# maps a human category word onto an AniList MediaListStatus, nothing when it
+# does not name a list (canonical enum names work as well)
+anilist_status_alias() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        watching | current | w) printf 'CURRENT' ;;
+        planning | planned | plan | watchlist | p) printf 'PLANNING' ;;
+        completed | complete | finished | finish | done | c) printf 'COMPLETED' ;;
+        rewatching | rewatch | repeating | repeat | r) printf 'REPEATING' ;;
+        paused | onhold | on-hold | hold | h) printf 'PAUSED' ;;
+        dropped | drop | d) printf 'DROPPED' ;;
+        *) printf '' ;;
+    esac
+}
+
+# human label for an AniList MediaListStatus
+anilist_status_label() {
+    case "$1" in
+        CURRENT) printf "Watching" ;;
+        PLANNING) printf "Planning" ;;
+        COMPLETED) printf "Completed" ;;
+        REPEATING) printf "Rewatching" ;;
+        PAUSED) printf "On Hold" ;;
+        DROPPED) printf "Dropped" ;;
+        *) printf "%s" "$1" ;;
+    esac
 }
 
 # read a line without echoing it (read -s is not available in POSIX sh)
@@ -218,18 +251,19 @@ anilist_update_progress() {
 
     _al_id="$1"
     _al_progress="$2"
-    _al_status="${3:-CURRENT}"
+    _al_status="${3:-}"
 
     [ -n "$_al_id" ] && [ -n "$_al_progress" ] ||
         die "Usage: ani-cli --anilist-update <media_id> <progress> [status]"
     printf "%d" "$_al_id" >/dev/null 2>&1 || die "Media ID must be a number."
     printf "%d" "$_al_progress" >/dev/null 2>&1 || die "Progress must be a number."
-    case "$_al_status" in
-        CURRENT | PLANNING | COMPLETED | DROPPED | PAUSED | REPEATING) ;;
-        *) printf "Warning: '%s' might not be a standard AniList status.\n" "$_al_status" ;;
-    esac
+    [ -n "$_al_status" ] || _al_status=CURRENT
+    _al_status=$(anilist_status_alias "$_al_status")
+    [ -n "$_al_status" ] ||
+        die "Unknown status '${3:-}'. Try: watching, planning, completed, rewatching, paused, dropped."
 
-    printf "Updating AniList entry %s to episode %s (%s)...\n" "$_al_id" "$_al_progress" "$_al_status"
+    _al_label=$(anilist_status_label "$_al_status")
+    printf "Updating AniList entry %s to episode %s (%s)...\n" "$_al_id" "$_al_progress" "$_al_label"
     _al_q='mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus) { SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status) { id progress status } }'
     _al_vars=$(jq -n --argjson id "$_al_id" --argjson p "$_al_progress" --arg s "$_al_status" '{mediaId: $id, progress: $p, status: $s}')
     # graphql errors die in the subshell only, so propagate the failure
@@ -240,8 +274,12 @@ anilist_update_progress() {
     exit 0
 }
 
+# anilist_get_list [status]
+# prints every non-custom list, or -- when a status is given -- only the
+# entries of that one category
 anilist_get_list() {
     anilist_check_jq
+    _al_status="$1"
 
     _al_token=$(anilist_get_token)
     [ -n "$_al_token" ] || die "Not authenticated with AniList. Run 'ani-cli --anilist-auth' first."
@@ -251,21 +289,32 @@ anilist_get_list() {
     _al_uname=$(printf "%s" "$_al_viewer" | jq -r '.data.Viewer.name // "unknown"' 2>/dev/null)
     [ -n "$_al_uid" ] || die "Could not read your AniList account."
 
-    _al_q='query ($userId: Int) { MediaListCollection(userId: $userId, type: ANIME) { lists { name status isCustomList entries { progress status score media { id episodes title { romaji english } } } } } }'
-    _al_vars=$(jq -n --argjson uid "$_al_uid" '{userId: $uid}')
+    _al_fields='lists { name status isCustomList entries { progress repeat status score media { id episodes title { romaji english } } } }'
+    if [ -n "$_al_status" ]; then
+        _al_q="query (\$userId: Int, \$status: MediaListStatus) { MediaListCollection(userId: \$userId, type: ANIME, status: \$status) { $_al_fields } }"
+        _al_vars=$(jq -n --argjson uid "$_al_uid" --arg s "$_al_status" '{userId: $uid, status: $s}')
+    else
+        _al_q="query (\$userId: Int) { MediaListCollection(userId: \$userId, type: ANIME) { $_al_fields } }"
+        _al_vars=$(jq -n --argjson uid "$_al_uid" '{userId: $uid}')
+    fi
     # graphql errors die in the subshell only, so propagate the failure
     _al_resp=$(anilist_graphql_query "$_al_q" "$_al_vars") || exit 1
     printf "%s" "$_al_resp" | jq -e '.data.MediaListCollection' >/dev/null 2>&1 ||
         die "Could not fetch your AniList lists."
 
-    printf "AniList list for %s:\n" "$_al_uname"
+    if [ -n "$_al_status" ]; then
+        _al_label=$(anilist_status_label "$_al_status")
+        printf "AniList %s list for %s:\n" "$_al_label" "$_al_uname"
+    else
+        printf "AniList list for %s:\n" "$_al_uname"
+    fi
     printf "%s" "$_al_resp" | jq -r '
         (.data.MediaListCollection.lists // [])[]
         | select((.isCustomList // false) | not)
         | (.entries // []) as $e
         | select(($e | length) > 0)
         | "\(.name // .status // "List") (\($e | length)):"
-        , ($e[] | "  - \(.media.title.english // .media.title.romaji // "Unknown title") (EP \(.progress)/\(.media.episodes // "?")) [\(.status)]\(if ((.score // 0) > 0) then " ★\(.score)" else "" end)")' ||
+        , ($e[] | "  - \(.media.title.english // .media.title.romaji // "Unknown title") (EP \(.progress)/\(.media.episodes // "?"))\(if ((.repeat // 0) > 0) then " [rewatched \(.repeat)x]" else "" end)\(if ((.score // 0) > 0) then " ★\(.score)" else "" end)")' ||
         die "Failed to format your AniList lists."
     exit 0
 }
@@ -357,25 +406,53 @@ EOF
 # ---------- progress tracking ----------
 
 # anilist_push_progress <media id> <progress>
-# background worker: looks up the episode count so a finished show is marked
-# COMPLETED; otherwise the entry's status is left untouched
+# background worker. One authenticated query reads the episode count plus the
+# current list entry (status/progress/rewatch count), then the entry is saved
+# with a sensible status for the new progress:
+#   - no entry            -> CURRENT
+#   - COMPLETED + earlier episode -> REPEATING, rewatch count +1 (a rewatch)
+#   - REPEATING at the last episode -> COMPLETED (rewatch finished)
+#   - CURRENT at the last episode   -> COMPLETED (first watch finished)
+#   - PLANNING / PAUSED / DROPPED   -> CURRENT (started/s/resumed)
 anilist_push_progress() {
     _al_id="$1"
     _al_progress="$2"
 
-    _al_q='query ($id: Int) { Media(id: $id, type: ANIME) { episodes } }'
+    _al_q='query ($id: Int) { Media(id: $id, type: ANIME) { episodes mediaListEntry { status progress repeat } } }'
     _al_vars=$(jq -n --argjson id "$_al_id" '{id: $id}')
-    _al_total=$(anilist_graphql_query "$_al_q" "$_al_vars" 2>/dev/null |
-        jq -r '.data.Media.episodes // empty' 2>/dev/null)
+    _al_resp=$(anilist_graphql_query "$_al_q" "$_al_vars" 2>/dev/null) || return 1
 
-    if [ -n "$_al_total" ] && [ "$_al_progress" -ge "$_al_total" ] 2>/dev/null; then
-        _al_q='mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus) { SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status) { id progress status } }'
-        _al_vars=$(jq -n --argjson id "$_al_id" --argjson p "$_al_progress" --arg s "COMPLETED" '{mediaId: $id, progress: $p, status: $s}')
-    else
-        _al_q='mutation ($mediaId: Int, $progress: Int) { SaveMediaListEntry(mediaId: $mediaId, progress: $progress) { id progress status } }'
-        _al_vars=$(jq -n --argjson id "$_al_id" --argjson p "$_al_progress" '{mediaId: $id, progress: $p}')
-    fi
-    anilist_graphql_query "$_al_q" "$_al_vars" >/dev/null
+    # decide the new (status, progress, repeat) in one place
+    _al_new=$(printf "%s" "$_al_resp" | jq -c --argjson p "$_al_progress" '
+        ($p | tonumber) as $p
+        | (.data.Media.episodes // null) as $ep
+        | (.data.Media.mediaListEntry // {}) as $e
+        | (($e.progress // 0) | tonumber) as $cur
+        | (($e.repeat // 0) | tonumber) as $rpt
+        | if $e.status == null then
+            { status: "CURRENT", progress: $p, repeat: 0 }
+          elif $e.status == "COMPLETED" and $p < $cur then
+            { status: "REPEATING", progress: $p, repeat: ($rpt + 1) }
+          elif $e.status == "REPEATING" and $ep != null and $p >= $ep then
+            { status: "COMPLETED", progress: $ep, repeat: $rpt }
+          elif $e.status == "CURRENT" and $ep != null and $p >= $ep then
+            { status: "COMPLETED", progress: $ep, repeat: $rpt }
+          elif $e.status == "PLANNING" then
+            { status: "CURRENT", progress: $p, repeat: $rpt }
+          elif $e.status == "PAUSED" or $e.status == "DROPPED" then
+            { status: "CURRENT", progress: $p, repeat: $rpt }
+          else
+            { status: $e.status, progress: $p, repeat: $rpt }
+          end' 2>/dev/null) || return 1
+
+    _al_nstatus=$(printf "%s" "$_al_new" | jq -r '.status' 2>/dev/null)
+    _al_nprogress=$(printf "%s" "$_al_new" | jq -r '.progress' 2>/dev/null)
+    _al_nrepeat=$(printf "%s" "$_al_new" | jq -r '.repeat' 2>/dev/null)
+    [ -n "$_al_nstatus" ] || return 1
+
+    _al_q='mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus, $repeat: Int) { SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status, repeat: $repeat) { id progress status repeat } }'
+    _al_vars=$(jq -n --argjson id "$_al_id" --argjson p "$_al_nprogress" --arg s "$_al_nstatus" --argjson r "$_al_nrepeat" '{mediaId: $id, progress: $p, status: $s, repeat: $r}')
+    anilist_graphql_query "$_al_q" "$_al_vars" >/dev/null || return 1
 }
 
 # called by ani-cli when an episode starts: <title> <episode number>
@@ -441,29 +518,35 @@ anilist_auto_track() {
 
 # ---------- watchlist selector ----------
 
-# -A: pick an entry from the AniList 'Watching' list and continue with it
+# -A [status]: pick an entry from an AniList list and continue with it.
+# Defaults to 'Watching'. Picking from 'Completed' restarts the show as a
+# rewatch from episode 1 (the tracker flips it to REPEATING and bumps the
+# rewatch count when the episode starts playing).
 anilist_select_watchlist() {
     anilist_check_jq
+    _al_status="${1:-CURRENT}"
+    _al_label=$(anilist_status_label "$_al_status")
+
     _al_token=$(anilist_get_token)
     [ -n "$_al_token" ] || die "Not authenticated with AniList. Run 'ani-cli --anilist-auth' first."
     dep_ch "$menu_program"
 
-    printf "Fetching your AniList 'Watching' list...\n"
+    printf "Fetching your AniList '%s' list...\n" "$_al_label"
     _al_viewer=$(anilist_graphql_query 'query { Viewer { id name } }') || exit 1
     _al_uid=$(printf "%s" "$_al_viewer" | jq -r '.data.Viewer.id // empty' 2>/dev/null)
     _al_uname=$(printf "%s" "$_al_viewer" | jq -r '.data.Viewer.name // "you"' 2>/dev/null)
     [ -n "$_al_uid" ] || die "Could not read your AniList account."
     printf "User: %s\n" "$_al_uname"
 
-    _al_q='query ($userId: Int) { MediaListCollection(userId: $userId, type: ANIME, status: CURRENT) { lists { entries { progress media { id episodes title { romaji english } } } } } }'
-    _al_vars=$(jq -n --argjson uid "$_al_uid" '{userId: $uid}')
+    _al_q='query ($userId: Int, $status: MediaListStatus) { MediaListCollection(userId: $userId, type: ANIME, status: $status) { lists { entries { progress repeat media { id episodes title { romaji english } } } } } }'
+    _al_vars=$(jq -n --argjson uid "$_al_uid" --arg s "$_al_status" '{userId: $uid, status: $s}')
     # graphql errors die in the subshell only, so propagate the failure
     _al_resp=$(anilist_graphql_query "$_al_q" "$_al_vars") || exit 1
     _al_rows=$(printf "%s" "$_al_resp" | jq -r '
         [((.data.MediaListCollection // {}).lists // [])[] | (.entries // [])[]]
         | unique_by(.media.id)[]
-        | "\(.media.id)\t\(.media.title.english // .media.title.romaji // "Unknown title") (EP \(.progress)/\(.media.episodes // "?"))"' 2>/dev/null)
-    [ -n "$_al_rows" ] || die "Your AniList 'Watching' list is empty."
+        | "\(.media.id)\t\(.media.title.english // .media.title.romaji // "Unknown title") (EP \(.progress)/\(.media.episodes // "?")\(if ((.repeat // 0) > 0) then ", rewatches \(.repeat)" else "" end))"' 2>/dev/null)
+    [ -n "$_al_rows" ] || die "Your AniList '$_al_label' list is empty."
 
     _al_sel=$(printf "%s\n" "$_al_rows" | nl -w 2 | sed 's/^[[:space:]]*//' | nth "Select anime: ")
     if [ -z "$_al_sel" ]; then
@@ -473,20 +556,25 @@ anilist_select_watchlist() {
 
     _al_media_id=$(printf "%s" "$_al_sel" | cut -f1)
     _al_display=$(printf "%s" "$_al_sel" | cut -f2)
-    _al_title=$(printf "%s" "$_al_display" | sed 's/ (EP [0-9][0-9]*\/.*)$//')
+    _al_title=$(printf "%s" "$_al_display" | sed 's/ (EP [^)]*)$//')
     _al_progress=$(printf "%s" "$_al_display" | sed -n 's/.*(EP \([0-9][0-9]*\)\/.*/\1/p')
-    _al_total=$(printf "%s" "$_al_display" | sed -n 's|.*/\([0-9][0-9]*\))$|\1|p')
+    _al_total=$(printf "%s" "$_al_display" | sed -n 's|.*/\([0-9][0-9]*\)[,)].*$|\1|p')
 
-    if [ -z "$_al_progress" ]; then
-        printf "Could not read your progress for '%s', starting at episode 1.\n" "$_al_title"
-        _al_progress=0
-    fi
-    _al_next=$((_al_progress + 1))
-    if [ -n "$_al_total" ] && [ "$_al_next" -gt "$_al_total" ]; then
-        die "You already watched all $_al_total episodes of '$_al_title'."
+    if [ "$_al_status" = "COMPLETED" ]; then
+        _al_next=1
+        printf "Rewatching '%s' from episode 1...\n" "$_al_title"
+    else
+        if [ -z "$_al_progress" ]; then
+            printf "Could not read your progress for '%s', starting at episode 1.\n" "$_al_title"
+            _al_progress=0
+        fi
+        _al_next=$((_al_progress + 1))
+        if [ -n "$_al_total" ] && [ "$_al_next" -gt "$_al_total" ]; then
+            die "You already watched all $_al_total episodes of '$_al_title'."
+        fi
+        printf "Next episode of '%s': %s\n" "$_al_title" "$_al_next"
     fi
 
-    printf "Next episode of '%s': %s\n" "$_al_title" "$_al_next"
     # hand the exact media id to the playback process so tracking never guesses
     export ANI_CLI_ANILIST_ID="$_al_media_id"
     set -- -e "$_al_next" "$_al_title"
@@ -505,8 +593,38 @@ anilist_select_watchlist() {
 ext_handle_option() {
     case "$1" in
         -A | --A | --anilist-watch)
+            _al_cat=$(anilist_status_alias "${2:-}")
+            if [ -n "$_al_cat" ]; then
+                ext_consumed=2
+                anilist_select_watchlist "$_al_cat"
+            else
+                ext_consumed=1
+                anilist_select_watchlist CURRENT
+            fi
+            ;;
+        --anilist-watching | --anilist-current)
             ext_consumed=1
-            anilist_select_watchlist
+            anilist_select_watchlist CURRENT
+            ;;
+        --anilist-planning)
+            ext_consumed=1
+            anilist_select_watchlist PLANNING
+            ;;
+        --anilist-completed | --anilist-finished)
+            ext_consumed=1
+            anilist_select_watchlist COMPLETED
+            ;;
+        --anilist-rewatching | --anilist-repeating)
+            ext_consumed=1
+            anilist_select_watchlist REPEATING
+            ;;
+        --anilist-paused)
+            ext_consumed=1
+            anilist_select_watchlist PAUSED
+            ;;
+        --anilist-dropped)
+            ext_consumed=1
+            anilist_select_watchlist DROPPED
             ;;
         --anilist-setup)
             ext_consumed=1
@@ -526,11 +644,17 @@ ext_handle_option() {
             ext_consumed=$#
             shift
             [ $# -ge 2 ] || die "Usage: ani-cli --anilist-update <media_id> <progress> [status]"
-            anilist_update_progress "$1" "$2" "${3:-CURRENT}"
+            anilist_update_progress "$1" "$2" "${3:-}"
             ;;
         --anilist-list | anilist-list)
-            ext_consumed=1
-            anilist_get_list
+            _al_cat=$(anilist_status_alias "${2:-}")
+            if [ -n "$_al_cat" ]; then
+                ext_consumed=2
+                anilist_get_list "$_al_cat"
+            else
+                ext_consumed=1
+                anilist_get_list ""
+            fi
             ;;
         --anilist-off)
             ext_consumed=1
@@ -546,14 +670,25 @@ ext_handle_option() {
 ext_help() {
     printf "
     AniList commands (ext.d/anilist.sh):
-      -A, --A                    Continue from your AniList 'Watching' list
+      -A, --A [status]           Continue from an AniList list (see below)
+      --anilist-watching         Continue from 'Watching' (same as -A)
+      --anilist-planning         Continue from 'Planning'
+      --anilist-completed        Continue from 'Completed' (starts a rewatch)
+      --anilist-rewatching       Continue from 'Rewatching'
+      --anilist-paused           Continue from 'Paused' (on hold)
+      --anilist-dropped          Continue from 'Dropped'
+      --anilist-list [status]    Show your anime list (or just one category)
       --anilist-setup            Configure your AniList API client (first run)
       --anilist-auth             Authenticate with AniList
       --anilist-search <term>    Search for anime on AniList
       --anilist-update <id> <ep> [status]
-                                 Update episode progress (status defaults to CURRENT)
-      --anilist-list             Show your anime list
+                                 Update episode progress (default status CURRENT)
       --anilist-off              Do not touch AniList during this run
+
+    Status: watching|current, planning, completed|finished, rewatching,
+      paused, dropped. Starting a finished anime again moves it to 'Rewatching'
+      and bumps the rewatch count automatically; finishing it marks it
+      COMPLETED again.
 
     Tracking:
       Once --anilist-setup and --anilist-auth are done, episodes that start

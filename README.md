@@ -591,17 +591,34 @@ redirect URL `https://anilist.co/api/v2/oauth/pin`.
 
 | Command | Description |
 | --- | --- |
-| `-A`, `--A` | Continue the next episode from your AniList 'Watching' list |
+| `-A`, `--A [status]` | Continue from an AniList list (default: 'Watching') |
+| `--anilist-watching` | Continue from 'Watching' (same as `-A`) |
+| `--anilist-planning` | Continue from 'Planning' |
+| `--anilist-completed` | Continue from 'Completed' (starts a rewatch) |
+| `--anilist-rewatching` | Continue from 'Rewatching' |
+| `--anilist-paused` | Continue from 'On Hold' |
+| `--anilist-dropped` | Continue from 'Dropped' |
 | `--anilist-search <term>` | Search for anime on AniList |
 | `--anilist-update <id> <ep> [status]` | Update episode progress (status defaults to `CURRENT`) |
-| `--anilist-list` | Show your anime list |
+| `--anilist-list [status]` | Show your anime list, or just one category |
 | `--anilist-off` | Do not touch AniList for this run |
+
+`status` is one of `watching`, `planning`, `completed` (or `finished`),
+`rewatching`, `paused` or `dropped`.
 
 When you have run the two setup commands, every episode that starts playing is
 pushed to AniList automatically. Titles are matched to AniList entries through
 `mappings.conf`; a title that cannot be matched exactly asks once (interactive
-runs only) and the answer is remembered. Watching the last episode marks the
-entry as `COMPLETED`.
+runs only) and the answer is remembered.
+
+Statuses adjust themselves:
+
+- reaching the last episode marks the entry `COMPLETED` (first watch or rewatch);
+- starting a `COMPLETED` anime again — via `-A completed` or by playing any
+  episode of it while it is still `COMPLETED` — moves it to `Rewatching` and
+  bumps its rewatch count;
+- starting from `Planning`, `Paused`/`On Hold` or `Dropped` moves the entry to
+  `Watching`.
 
 State lives in `${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli`: `anilist.conf`
 (client id/secret), `token` (OAuth token) and `mappings.conf` (title map).

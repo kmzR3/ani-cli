@@ -70,8 +70,26 @@ Don't detach the player (useful for in-terminal playback, mpv only)
 \fB\--exit-after-play\fR
 Exit the player, and return the player exit code (useful for non interactive scenarios, mpv only)
 .TP
-\fB\-A, \-\-A\fR
-Continue the next episode from your AniList 'Watching' list
+\fB\-A, \-\-A\fR [\fIstatus\fR]
+Continue the next episode from an AniList list. Defaults to the 'Watching' list. \fIstatus\fR may be watching, planning, completed, rewatching, paused or dropped. 'Completed' starts the show again as a rewatch from episode 1.
+.TP
+\fB\--anilist-watching\fR
+Continue from the 'Watching' list (same as \-A)
+.TP
+\fB\--anilist-planning\fR
+Continue from the 'Planning' list
+.TP
+\fB\--anilist-completed\fR
+Continue from the 'Completed' list (starts a rewatch)
+.TP
+\fB\--anilist-rewatching\fR
+Continue from the 'Rewatching' list
+.TP
+\fB\--anilist-paused\fR
+Continue from the 'On Hold' list
+.TP
+\fB\--anilist-dropped\fR
+Continue from the 'Dropped' list
 .TP
 \fB\--anilist-setup\fR
 Configure the AniList API client (first run)
@@ -85,8 +103,8 @@ Search for anime on AniList
 \fB\--anilist-update\fR \fIid\fR \fIep\fR [\fIstatus\fR]
 Update episode progress manually (status defaults to CURRENT)
 .TP
-\fB\--anilist-list\fR
-Show your AniList
+\fB\--anilist-list\fR [\fIstatus\fR]
+Show your anime list, or just one category (watching, planning, completed, rewatching, paused, dropped)
 .TP
 \fB\--anilist-off\fR
 Do not touch AniList during this run
@@ -151,7 +169,11 @@ Set to 1 to disable AniList tracking for a run. Can be 0 (enabled) or 1 (disable
 .PP
 AniList support is provided by the optional extension ext.d/anilist.sh, which ani-cli sources at startup. It is completely self-contained: deleting the file restores stock ani-cli. Requires jq.
 .PP
-Run 'ani-cli --anilist-setup' and 'ani-cli --anilist-auth' once to connect an account. After that, episodes that start playing are pushed to AniList automatically, using mappings.conf to map scraped titles to AniList entries. Watching the last episode marks the entry as COMPLETED. State is kept in ${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli.
+Run 'ani-cli --anilist-setup' and 'ani-cli --anilist-auth' once to connect an account. After that, episodes that start playing are pushed to AniList automatically, using mappings.conf to map scraped titles to AniList entries. State is kept in ${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli.
+.PP
+The status words watching, planning, completed, rewatching, paused and dropped select which AniList list \fB\-A\fR, the \fB\--anilist-*\fR watch options and \fB\--anilist-list\fR operate on.
+.PP
+Rewatches are handled automatically. Starting a COMPLETED anime again -- by picking it with \fB\-A completed\fR or by playing any episode while it is still marked COMPLETED -- moves the entry to 'Rewatching' and increases its rewatch count. Reaching the last episode marks an entry COMPLETED again (first watch or rewatch); starting an entry from 'Planning', 'On Hold' or 'Dropped' moves it to 'Watching'.
 .PP
 .SH EPISODE SELECTION
 .PP
